@@ -1,0 +1,4 @@
+0001-disable-user-agent-restrictions.patch
+0002-disable-telemetry.patch
+0101-ua-profile.patch
+0201-libcurl-impersonate.patch

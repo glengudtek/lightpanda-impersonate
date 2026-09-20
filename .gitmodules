@@ -1,0 +1,3 @@
+[submodule "lightpanda-browser"]
+	path = lightpanda-browser
+	url = https://github.com/lightpanda-io/browser

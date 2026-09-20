@@ -1,0 +1,35 @@
+diff --git a/src/telemetry/telemetry.zig b/src/telemetry/telemetry.zig
+index a3a7555cf..85a797b98 100644
+--- a/src/telemetry/telemetry.zig
++++ b/src/telemetry/telemetry.zig
+@@ -9,11 +9,15 @@ const IID_FILE = "iid";
+ const Allocator = std.mem.Allocator;
+ 
+ pub fn isDisabled() bool {
+-    if (lp.IS_DEBUG or lp.IS_TEST) {
+-        return true;
+-    }
++    return isDisabledForEnv(
++        lp.IS_DEBUG,
++        lp.IS_TEST,
++        std.c.getenv("LIGHTPANDA_DISABLE_TELEMETRY") != null,
++    );
++}
+ 
+-    return std.c.getenv("LIGHTPANDA_DISABLE_TELEMETRY") != null;
++fn isDisabledForEnv(_: bool, _: bool, _: bool) bool {
++    return true;
+ }
+ 
+ pub const Telemetry = TelemetryT(@import("lightpanda.zig"));
+@@ -179,6 +183,10 @@ test "telemetry: always disabled in debug builds" {
+     telemetry.record(.{ .run = {} });
+ }
+ 
++test "telemetry: disabled in release builds without environment override" {
++    try testing.expectEqual(true, isDisabledForEnv(false, false, false));
++}
++
+ test "telemetry: getOrCreateId" {
+     defer std.Io.Dir.cwd().deleteFile(testing.io, "/tmp/" ++ IID_FILE) catch {};
+ 

@@ -1,0 +1,197 @@
+diff --git a/build.zig b/build.zig
+index a8aa03fe7..43cd96718 100644
+--- a/build.zig
++++ b/build.zig
+@@ -110,6 +110,10 @@ pub fn build(b: *Build) !void {
+     const ua_profile_config_path = b.option([]const u8, "ua_profile_config", "Path to UA profile ZON config") orelse "../ua-profile.zon";
+     const ua_profile_config = readUaProfileConfig(b, ua_profile_config_path);
+     const ua_profile = resolveUaProfileConfig(b, ua_profile_config);
++    const curl_impersonate_root = b.option([]const u8, "curl_impersonate_root", "Path containing libcurl-impersonate.a and include/curl") orelse b.fmt(
++        ".lp-cache/curl-impersonate/v2.2.2/{s}-linux-gnu",
++        .{@tagName(target.result.cpu.arch)},
++    );
+     const shared_v8 = b.option(bool, "shared_v8", "Link V8 as a shared library") orelse (dev_fast or (prebuilt_v8_path != null and std.mem.endsWith(u8, prebuilt_v8_path.?, ".so")));
+     const use_llvm = b.option(bool, "use_llvm", "Use the LLVM backend") orelse !dev_fast;
+     // Hot-code layout for the Linux release artifacts, see orderfile/README.md.
+@@ -160,7 +164,7 @@ pub fn build(b: *Build) !void {
+     const v8_archive: ?Build.LazyPath = if (prebuilt_v8_path) |path| .{ .cwd_relative = path } else null;
+     const v8_for_link = if (orderfile != null and v8_archive != null and !shared_v8) markHotSections(b, v8_archive.?) else v8_archive;
+     linkV8(b, lightpanda_module, enable_asan, enable_tsan, v8_for_link, shared_v8);
+-    linkCurl(b, lightpanda_module, deps, enable_tsan, orderfile != null);
++    linkCurl(b, lightpanda_module, curl_impersonate_root);
+     linkRust(b, lightpanda_module, deps);
+     linkZenai(b, lightpanda_module);
+     linkIsocline(b, lightpanda_module);
+@@ -734,43 +738,33 @@ fn linkPcre2(b: *Build, mod: *Build.Module, deps: Deps, enable_csan: ?std.zig.Sa
+     mod.addImport("pcre2", translate_c.createModule());
+ }
+ 
+-fn linkCurl(b: *Build, mod: *Build.Module, deps: Deps, is_tsan: bool, section: bool) void {
+-    const curl = buildCurl(b, deps.target, deps.optimize, is_tsan, section);
+-    mod.linkLibrary(curl);
++fn linkCurl(b: *Build, mod: *Build.Module, curl_impersonate_root: []const u8) void {
++    const target = mod.resolved_target.?;
++    if (target.result.os.tag != .linux) {
++        @panic("libcurl-impersonate is supported on Linux only");
++    }
+ 
+-    const dep = b.dependency("curl", .{});
++    const include_path = b.pathJoin(&.{ curl_impersonate_root, "include" });
++    const archive_path = b.pathJoin(&.{ curl_impersonate_root, "libcurl-impersonate.a" });
++    mod.addIncludePath(.{ .cwd_relative = include_path });
++    mod.addObjectFile(.{ .cwd_relative = archive_path });
++
++    const curl_header = b.addWriteFiles().add("curl-impersonate-import.h", "#include <curl/curl.h>\n");
+     const translate_c = b.addTranslateC(.{
+-        .root_source_file = dep.path("include/curl/curl.h"),
+-        .target = mod.resolved_target.?,
++        .root_source_file = curl_header,
++        .target = target,
+         .optimize = mod.optimize.?,
+     });
+-    translate_c.addIncludePath(dep.path("include"));
++    translate_c.addIncludePath(.{ .cwd_relative = include_path });
++    translate_c.defineCMacro("CURL_STATICLIB", "1");
+     mod.addImport("curl", translate_c.createModule());
+ 
+-    const zlib = buildZlib(b, deps.target, deps.optimize, is_tsan, section);
+-    curl.root_module.linkLibrary(zlib);
+-
+-    const brotli = buildBrotli(b, deps.target, deps.optimize, is_tsan, section);
+-    for (brotli) |lib| curl.root_module.linkLibrary(lib);
+-
+-    const nghttp2 = buildNghttp2(b, deps.target, deps.optimize, is_tsan, section);
+-    curl.root_module.linkLibrary(nghttp2);
+-
+-    const boringssl = buildBoringSsl(b, deps.target, deps.optimize, section);
+-    for (boringssl) |lib| curl.root_module.linkLibrary(lib);
+-
+-    if (deps.target.result.os.tag == .macos) {
+-        // needed for proxying on mac
+-        const framework_path = if (b.sysroot) |sysroot|
+-            b.pathJoin(&.{ sysroot, "System/Library/Frameworks" })
+-        else if (b.graph.environ_map.get("SDKROOT")) |sdk_root|
+-            b.pathJoin(&.{ sdk_root, "System/Library/Frameworks" })
+-        else
+-            "/System/Library/Frameworks";
+-        mod.addSystemFrameworkPath(.{ .cwd_relative = framework_path });
+-        mod.linkFramework("CoreFoundation", .{});
+-        mod.linkFramework("SystemConfiguration", .{});
+-    }
++    // The release archive bundles BoringSSL, brotli, zlib, zstd, nghttp2,
++    // nghttp3, ngtcp2 and libidn2. Only standard Linux runtime libraries
++    // remain unresolved.
++    mod.linkSystemLibrary("m", .{});
++    mod.linkSystemLibrary("dl", .{});
++    mod.linkSystemLibrary("pthread", .{});
+ }
+ 
+ fn cLibModule(b: *Build, target: Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, is_tsan: bool) *Build.Module {
+diff --git a/src/Config.zig b/src/Config.zig
+index e56e5edf4..2548dbd49 100644
+--- a/src/Config.zig
++++ b/src/Config.zig
+@@ -261,6 +261,7 @@ const CommonOptions = .{
+     .{ .name = "http_nav_burst", .type = ?u32 },
+     .{ .name = "http_timeout", .type = ?u31 },
+     .{ .name = "http_version", .type = HttpVersion, .default = .auto },
++    .{ .name = "curl_impersonate", .type = [:0]const u8, .default = build_config.ua_profile_curl_impersonate },
+     .{ .name = "http_connect_timeout", .type = ?u31 },
+     .{ .name = "http_header", .type = HttpHeader, .multiple = true, .validator = httpHeaderValidator },
+     .{ .name = "http_max_response_size", .type = ?usize },
+@@ -731,6 +732,13 @@ pub fn userAgent(self: *const Config) ?[]const u8 {
+     };
+ }
+ 
++pub fn curlImpersonate(self: *const Config) [:0]const u8 {
++    return switch (self.mode) {
++        inline .serve, .fetch, .mcp, .agent => |opts| opts.curl_impersonate,
++        else => build_config.ua_profile_curl_impersonate,
++    };
++}
++
+ pub fn locale(self: *const Config) [:0]const u8 {
+     return switch (self.mode) {
+         inline .serve, .fetch, .mcp, .agent => |opts| opts.locale,
+@@ -1352,6 +1360,22 @@ test "Config: parseArgs --http-version" {
+     }
+ }
+ 
++test "Config: parseArgs --curl-impersonate" {
++    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
++    defer arena.deinit();
++
++    {
++        const argv = [_][*:0]const u8{ "lightpanda", "fetch", "https://example.com" };
++        const config = try parseArgs(arena.allocator(), .{ .vector = &argv });
++        try std.testing.expectEqualStrings(build_config.ua_profile_curl_impersonate, config.curlImpersonate());
++    }
++    {
++        const argv = [_][*:0]const u8{ "lightpanda", "serve", "--curl-impersonate", "chrome145" };
++        const config = try parseArgs(arena.allocator(), .{ .vector = &argv });
++        try std.testing.expectEqualStrings("chrome145", config.curlImpersonate());
++    }
++}
++
+ test "Config: parseArgs --http-session-timeout" {
+     // parseArgs allocations live for the process; an arena stands in for main's.
+     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+diff --git a/src/help.zon b/src/help.zon
+index 683de267b..6fea5b3ec 100644
+--- a/src/help.zon
++++ b/src/help.zon
+@@ -451,6 +451,9 @@
+     \\  --insecure-disable-tls-host-verification
+     \\          Disables host verification on all HTTP requests.
+     \\          Only set this if you understand and accept the risk.
++    \\  --curl-impersonate <PROFILE>
++    \\          curl-impersonate TLS/HTTP profile. Defaults to the value built
++    \\          from ua-profile.zon.
+     \\  --locale <TAG>
+     \\          BCP 47 language tag driving navigator.language, the
+     \\          Accept-Language header and the default locale of Intl and
+diff --git a/src/network/curl_impersonate.zig b/src/network/curl_impersonate.zig
+new file mode 100644
+index 000000000..d8336f21f
+--- /dev/null
++++ b/src/network/curl_impersonate.zig
+@@ -0,0 +1,19 @@
++const libcurl = @import("../sys/libcurl.zig");
++
++extern fn curl_easy_impersonate(
++    easy: *libcurl.Curl,
++    target: [*]const u8,
++    default_headers: c_int,
++) libcurl.CurlCode;
++
++const Error = error{
++    EmptyCurlImpersonateProfile,
++    CurlImpersonateFailed,
++};
++
++pub fn apply(easy: *libcurl.Curl, profile: [:0]const u8) Error!void {
++    if (profile.len == 0) return error.EmptyCurlImpersonateProfile;
++    if (curl_easy_impersonate(easy, profile.ptr, 0) != libcurl.CURLE.OK) {
++        return error.CurlImpersonateFailed;
++    }
++}
+diff --git a/src/network/http.zig b/src/network/http.zig
+index 5b7e77402..6016ffa5c 100644
+--- a/src/network/http.zig
++++ b/src/network/http.zig
+@@ -22,6 +22,7 @@ const lp = @import("lightpanda");
+ const Config = @import("../Config.zig");
+ const sys_net = @import("../sys/net.zig");
+ const libcurl = @import("../sys/libcurl.zig");
++const curl_impersonate = @import("curl_impersonate.zig");
+ const crypto = @import("../sys/libcrypto.zig");
+ 
+ const IpFilter = @import("IpFilter.zig");
+@@ -462,6 +463,7 @@ pub const Connection = struct {
+         ip_filter: ?*const IpFilter,
+     ) !void {
+         libcurl.curl_easy_reset(self._easy);
++        try curl_impersonate.apply(self._easy, config.curlImpersonate());
+         self.transport = .none;
+         self.clearHeaders();
+ 

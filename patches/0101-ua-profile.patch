@@ -1,0 +1,470 @@
+diff --git a/build.zig b/build.zig
+index 8b8b41ada..a8aa03fe7 100644
+--- a/build.zig
++++ b/build.zig
+@@ -33,6 +33,27 @@ const Build = blk: {
+     break :blk std.Build;
+ };
+ 
++const UaBrand = struct {
++    brand: [:0]const u8,
++    version: [:0]const u8,
++};
++
++const UaProfileConfig = struct {
++    full_version: [:0]const u8 = "1.0.0.0",
++    include_google_chrome_brand: bool = false,
++    additional_brands: []const UaBrand = &.{},
++    manual_brands: ?[]const UaBrand = null,
++    user_agent: ?[:0]const u8 = null,
++    curl_impersonate: [:0]const u8 = "chrome146",
++};
++
++const ResolvedUaProfile = struct {
++    user_agent: [:0]const u8,
++    full_version: [:0]const u8,
++    low_entropy_brands: []const UaBrand,
++    high_entropy_brands: []const UaBrand,
++};
++
+ pub fn build(b: *Build) !void {
+     const optimize = b.standardOptimizeOption(.{});
+     const requested_target = b.standardTargetOptions(.{});
+@@ -86,6 +107,9 @@ pub fn build(b: *Build) !void {
+     const prebuilt_v8_path = prebuilt_v8_path_option orelse if (enable_tsan or enable_asan) null else findPrebuiltV8(b, target, dev_fast);
+     const snapshot_path = b.option([]const u8, "snapshot_path", "Path to v8 snapshot");
+     const wpt_extensions = b.option(bool, "wpt_extensions", "Extend WebAPI with WPT driver behavior") orelse false;
++    const ua_profile_config_path = b.option([]const u8, "ua_profile_config", "Path to UA profile ZON config") orelse "../ua-profile.zon";
++    const ua_profile_config = readUaProfileConfig(b, ua_profile_config_path);
++    const ua_profile = resolveUaProfileConfig(b, ua_profile_config);
+     const shared_v8 = b.option(bool, "shared_v8", "Link V8 as a shared library") orelse (dev_fast or (prebuilt_v8_path != null and std.mem.endsWith(u8, prebuilt_v8_path.?, ".so")));
+     const use_llvm = b.option(bool, "use_llvm", "Use the LLVM backend") orelse !dev_fast;
+     // Hot-code layout for the Linux release artifacts, see orderfile/README.md.
+@@ -103,6 +127,13 @@ pub fn build(b: *Build) !void {
+     opts.addOption([]const u8, "version_encoded", version_encoded);
+     opts.addOption(?[]const u8, "snapshot_path", snapshot_path);
+     opts.addOption(bool, "wpt_extensions", wpt_extensions);
++    opts.addOption([:0]const u8, "ua_profile_user_agent", ua_profile.user_agent);
++    opts.addOption([:0]const u8, "ua_profile_curl_impersonate", ua_profile_config.curl_impersonate);
++    opts.addOption([:0]const u8, "ua_profile_ua_full_version", ua_profile.full_version);
++    opts.addOption([]const [:0]const u8, "ua_profile_brand_names", uaProfileBrandNames(b, ua_profile.low_entropy_brands));
++    opts.addOption([]const [:0]const u8, "ua_profile_brand_versions", uaProfileBrandVersions(b, ua_profile.low_entropy_brands));
++    opts.addOption([]const [:0]const u8, "ua_profile_full_version_brand_names", uaProfileBrandNames(b, ua_profile.high_entropy_brands));
++    opts.addOption([]const [:0]const u8, "ua_profile_full_version_brand_versions", uaProfileBrandVersions(b, ua_profile.high_entropy_brands));
+ 
+     const lightpanda_module = b.addModule("lightpanda", .{
+         .root_source_file = b.path("src/lightpanda.zig"),
+@@ -225,6 +256,191 @@ const Deps = struct {
+     optimize: std.builtin.OptimizeMode,
+ };
+ 
++fn readUaProfileConfig(b: *Build, path: []const u8) UaProfileConfig {
++    const bytes = std.Io.Dir.cwd().readFileAllocOptions(
++        b.graph.io,
++        path,
++        b.allocator,
++        .limited(1024 * 1024),
++        .of(u8),
++        0,
++    ) catch |err| switch (err) {
++        error.FileNotFound => return .{},
++        else => |e| {
++            std.debug.panic("failed to read UA profile config '{s}': {s}", .{ path, @errorName(e) });
++        },
++    };
++
++    const source = b.allocator.dupeZ(u8, bytes) catch @panic("OOM");
++    var diagnostics: std.zon.parse.Diagnostics = .{};
++    defer diagnostics.deinit(b.allocator);
++    const config = std.zon.parse.fromSliceAlloc(UaProfileConfig, b.allocator, source, &diagnostics, .{}) catch |err| {
++        std.debug.panic("failed to load UA profile config '{s}': {s}", .{ path, @errorName(err) });
++    };
++    return config;
++}
++
++fn resolveUaProfileConfig(b: *Build, config: UaProfileConfig) ResolvedUaProfile {
++    const major = b.allocator.dupeZ(u8, majorVersion(config.full_version)) catch @panic("OOM");
++    const user_agent = config.user_agent orelse b.allocator.dupeZ(
++        u8,
++        b.fmt(
++            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{s}.0.0.0 Safari/537.36",
++            .{major},
++        ),
++    ) catch @panic("OOM");
++
++    if (config.manual_brands) |manual| {
++        return .{
++            .user_agent = user_agent,
++            .full_version = config.full_version,
++            .low_entropy_brands = normalizeBrandList(b, manual, false),
++            .high_entropy_brands = normalizeBrandList(b, manual, true),
++        };
++    }
++
++    const seed = std.fmt.parseInt(usize, major, 10) catch |err| {
++        std.debug.panic("UA profile full_version must start with a numeric major version: {s}", .{@errorName(err)});
++    };
++
++    return .{
++        .user_agent = user_agent,
++        .full_version = config.full_version,
++        .low_entropy_brands = generatedBrandList(b, seed, major, false, config.include_google_chrome_brand, config.additional_brands),
++        .high_entropy_brands = generatedBrandList(b, seed, config.full_version, true, config.include_google_chrome_brand, config.additional_brands),
++    };
++}
++
++fn majorVersion(version: [:0]const u8) []const u8 {
++    return version[0 .. std.mem.indexOfScalar(u8, version, '.') orelse version.len];
++}
++
++fn generatedBrandList(
++    b: *Build,
++    seed: usize,
++    version: [:0]const u8,
++    full_version: bool,
++    include_google_chrome_brand: bool,
++    additional_brands: []const UaBrand,
++) []const UaBrand {
++    const len = 2 + @as(usize, if (include_google_chrome_brand) 1 else 0) + additional_brands.len;
++    if (len < 2 or len > 4) {
++        std.debug.panic("UA profile brand list size must be between 2 and 4, got {}", .{len});
++    }
++
++    const input = b.allocator.alloc(UaBrand, len) catch @panic("OOM");
++    input[0] = greasedBrandVersion(b, seed, full_version);
++    input[1] = .{ .brand = "Chromium", .version = version };
++
++    var i: usize = 2;
++    if (include_google_chrome_brand) {
++        input[i] = .{ .brand = "Google Chrome", .version = version };
++        i += 1;
++    }
++    for (additional_brands) |brand| {
++        input[i] = normalizeBrand(b, brand, full_version);
++        i += 1;
++    }
++
++    return shuffleBrandList(b, seed, input);
++}
++
++fn normalizeBrandList(b: *Build, brands: []const UaBrand, full_version: bool) []const UaBrand {
++    const out = b.allocator.alloc(UaBrand, brands.len) catch @panic("OOM");
++    for (brands, out) |brand, *normalized| {
++        normalized.* = normalizeBrand(b, brand, full_version);
++    }
++    return out;
++}
++
++fn normalizeBrand(b: *Build, brand: UaBrand, full_version: bool) UaBrand {
++    if (full_version or std.mem.indexOfScalar(u8, brand.version, '.') == null) {
++        return brand;
++    }
++
++    return .{
++        .brand = brand.brand,
++        .version = b.allocator.dupeZ(u8, majorVersion(brand.version)) catch @panic("OOM"),
++    };
++}
++
++fn greasedBrandVersion(b: *Build, seed: usize, full_version: bool) UaBrand {
++    const greasey_chars = [_][]const u8{ " ", "(", ":", "-", ".", "/", ")", ";", "=", "?", "_" };
++    const greased_versions = [_][:0]const u8{ "8", "99", "24" };
++    const base_version = greased_versions[seed % greased_versions.len];
++    return .{
++        .brand = b.allocator.dupeZ(u8, b.fmt("Not{s}A{s}Brand", .{
++            greasey_chars[seed % greasey_chars.len],
++            greasey_chars[(seed + 1) % greasey_chars.len],
++        })) catch @panic("OOM"),
++        .version = if (full_version)
++            b.allocator.dupeZ(u8, b.fmt("{s}.0.0.0", .{base_version})) catch @panic("OOM")
++        else
++            base_version,
++    };
++}
++
++fn shuffleBrandList(b: *Build, seed: usize, input: []const UaBrand) []const UaBrand {
++    const order = randomOrder(b, seed, input.len);
++    const out = b.allocator.alloc(UaBrand, input.len) catch @panic("OOM");
++    for (input, order) |brand, index| {
++        out[index] = brand;
++    }
++    return out;
++}
++
++fn randomOrder(b: *Build, seed: usize, size: usize) []const usize {
++    if (size < 2 or size > 4) {
++        std.debug.panic("UA profile brand order size must be between 2 and 4, got {}", .{size});
++    }
++
++    var order_index = seed % factorial(size);
++    const remaining = b.allocator.alloc(usize, size) catch @panic("OOM");
++    const order = b.allocator.alloc(usize, size) catch @panic("OOM");
++    for (remaining, 0..) |*slot, i| {
++        slot.* = i;
++    }
++
++    var remaining_len = size;
++    for (order) |*slot| {
++        const block_size = factorial(remaining_len - 1);
++        const selected = order_index / block_size;
++        order_index %= block_size;
++        slot.* = remaining[selected];
++        std.mem.copyForwards(usize, remaining[selected..], remaining[selected + 1 .. remaining_len]);
++        remaining_len -= 1;
++    }
++    return order;
++}
++
++fn factorial(n: usize) usize {
++    if (n < 2) {
++        return 1;
++    }
++
++    var out: usize = 1;
++    for (2..n + 1) |i| {
++        out *= i;
++    }
++    return out;
++}
++
++fn uaProfileBrandNames(b: *Build, brands: []const UaBrand) []const [:0]const u8 {
++    const names = b.allocator.alloc([:0]const u8, brands.len) catch @panic("OOM");
++    for (brands, names) |brand, *name| {
++        name.* = brand.brand;
++    }
++    return names;
++}
++
++fn uaProfileBrandVersions(b: *Build, brands: []const UaBrand) []const [:0]const u8 {
++    const versions = b.allocator.alloc([:0]const u8, brands.len) catch @panic("OOM");
++    for (brands, versions) |brand, *version| {
++        version.* = brand.version;
++    }
++    return versions;
++}
++
+ const ExeConfig = struct {
+     check: *Build.Step,
+     lightpanda_module: *Build.Module,
+diff --git a/src/Config.zig b/src/Config.zig
+index 26816f756..e56e5edf4 100644
+--- a/src/Config.zig
++++ b/src/Config.zig
+@@ -27,6 +27,7 @@ const Mime = @import("browser/Mime.zig");
+ 
+ const WebBotAuthConfig = @import("network/WebBotAuth.zig").Config;
+ const HttpHeader = @import("network/http.zig").Header;
++const build_config = @import("build_config");
+ 
+ const log = lp.log;
+ const crypto = @import("sys/libcrypto.zig");
+@@ -960,7 +961,8 @@ pub const WaitUntil = enum {
+ /// HTTP header values shared across Http and Client.
+ /// Must be initialized with an allocator that outlives all HTTP connections.
+ pub const HttpHeaders = struct {
+-    const user_agent_base: [:0]const u8 = "Lightpanda/1.0";
++    const user_agent_base: [:0]const u8 = build_config.ua_profile_user_agent;
++    pub const ua_full_version: [:0]const u8 = build_config.ua_profile_ua_full_version;
+ 
+     const Brand = struct {
+         brand: [:0]const u8,
+@@ -971,8 +973,28 @@ pub const HttpHeaders = struct {
+     /// Source of truth for client-hints brand data. Both the Sec-Ch-Ua
+     /// HTTP header and navigator.userAgentData.brands derive from this
+     /// list, so the two sides cannot drift.
+-    pub const brands = [_]Brand{
+-        .{ .brand = "Lightpanda", .version = "1", .full_version = lp.build_config.version },
++    pub const brands = blk: {
++        if (build_config.ua_profile_brand_names.len != build_config.ua_profile_brand_versions.len) {
++            @compileError("UA profile brand names and versions must have the same length");
++        }
++
++        var out: [build_config.ua_profile_brand_names.len]Brand = undefined;
++        for (build_config.ua_profile_brand_names, build_config.ua_profile_brand_versions, 0..) |brand, version, i| {
++            out[i] = .{ .brand = brand, .version = version, .full_version = version };
++        }
++        break :blk out;
++    };
++
++    pub const full_version_brands = blk: {
++        if (build_config.ua_profile_full_version_brand_names.len != build_config.ua_profile_full_version_brand_versions.len) {
++            @compileError("UA profile full-version brand names and versions must have the same length");
++        }
++
++        var out: [build_config.ua_profile_full_version_brand_names.len]Brand = undefined;
++        for (build_config.ua_profile_full_version_brand_names, build_config.ua_profile_full_version_brand_versions, 0..) |brand, version, i| {
++            out[i] = .{ .brand = brand, .version = version, .full_version = version };
++        }
++        break :blk out;
+     };
+ 
+     pub fn secChUaForBrands(comptime brand_list: anytype) ?[:0]const u8 {
+@@ -992,7 +1014,7 @@ pub const HttpHeaders = struct {
+ 
+     pub const sec_ch_ua_full_version_list: [:0]const u8 = blk: {
+         var out: [:0]const u8 = "";
+-        for (brands, 0..) |b, i| {
++        for (full_version_brands, 0..) |b, i| {
+             const sep = if (i == 0) "" else ", ";
+             out = out ++ sep ++ "\"" ++ b.brand ++ "\";v=\"" ++ b.full_version ++ "\"";
+         }
+diff --git a/src/browser/tests/navigator/navigator.html b/src/browser/tests/navigator/navigator.html
+index 78156be4e..fd4deded7 100644
+--- a/src/browser/tests/navigator/navigator.html
++++ b/src/browser/tests/navigator/navigator.html
+@@ -5,9 +5,10 @@
+   // Navigator should be accessible from window
+   testing.expectEqual(navigator, window.navigator);
+   testing.expectEqual(true, navigator.userAgent.length > 0);
+-  testing.expectEqual(true, navigator.userAgent.includes('Lightpanda'));
++  testing.expectEqual(true, navigator.userAgent.includes('Mozilla/5.0'));
++  testing.expectEqual(true, /Chrome\/\d+\.0\.0\.0/.test(navigator.userAgent));
+   testing.expectEqual('Netscape', navigator.appName);
+-  testing.expectEqual('1.0', navigator.appVersion);
++  testing.expectEqual(true, navigator.appVersion.startsWith('5.0 ('));
+   testing.expectEqual(true, navigator.platform.length > 0);
+ 
+   // Platform should be one of the known values
+@@ -125,9 +126,14 @@
+   const validUAPlatforms = ['macOS', 'Windows', 'Linux', 'FreeBSD', 'Unknown'];
+   testing.expectEqual(true, validUAPlatforms.includes(navigator.userAgentData.platform));
+ 
+-  testing.expectEqual(1, navigator.userAgentData.brands.length);
+-  testing.expectEqual('Lightpanda', navigator.userAgentData.brands[0].brand);
+-  testing.expectEqual("1.0.0-", navigator.userAgentData.brands[0].version.substring(0,6));
++  const chromeMajor = navigator.userAgent.match(/Chrome\/(\d+)\.0\.0\.0/)[1];
++  const lowEntropyBrands = new Map(navigator.userAgentData.brands.map(({brand, version}) => [brand, version]));
++  testing.expectEqual(3, navigator.userAgentData.brands.length);
++  testing.expectEqual(chromeMajor, lowEntropyBrands.get('Chromium'));
++  testing.expectEqual(chromeMajor, lowEntropyBrands.get('Google Chrome'));
++  testing.expectEqual(true, navigator.userAgentData.brands.some(({brand, version}) =>
++    brand.startsWith('Not') && brand.endsWith('Brand') && ['8', '99', '24'].includes(version)
++  ));
+ 
+   // Same instance returned on repeated access
+   testing.expectEqual(true, navigator.userAgentData === navigator.userAgentData);
+@@ -136,7 +142,8 @@
+   testing.expectEqual(false, json.mobile);
+   testing.expectEqual(navigator.userAgentData.platform, json.platform);
+   testing.expectEqual(true, Array.isArray(json.brands));
+-  testing.expectEqual('Lightpanda', json.brands[0].brand);
++  const jsonBrands = new Map(json.brands.map(({brand, version}) => [brand, version]));
++  testing.expectEqual(chromeMajor, jsonBrands.get('Chromium'));
+ </script>
+ 
+ <script id=userAgentData_highEntropy type=module>
+@@ -152,8 +159,12 @@
+       testing.expectEqual(navigator.userAgentData.platform, v.platform);
+       testing.expectEqual(true, Array.isArray(v.brands));
+       testing.expectEqual(true, Array.isArray(v.fullVersionList));
+-      testing.expectEqual('Lightpanda', v.fullVersionList[0].brand);
+-      testing.expectEqual('1.0.0-', v.uaFullVersion.substring(0,6));
++      const fullVersionBrands = new Map(v.fullVersionList.map(({brand, version}) => [brand, version]));
++      testing.expectEqual(true, /^\d+\.\d+\.\d+\.\d+$/.test(fullVersionBrands.get('Chromium')));
++      testing.expectEqual(fullVersionBrands.get('Chromium'), fullVersionBrands.get('Google Chrome'));
++      testing.expectEqual(true, v.fullVersionList.some(({brand, version}) =>
++        brand.startsWith('Not') && brand.endsWith('Brand') && /^(8|99|24)\.0\.0\.0$/.test(version)
++      ));
+       testing.expectEqual(false, v.wow64);
+       testing.expectEqual(true, Array.isArray(v.formFactor));
+       testing.expectEqual('Desktop', v.formFactor[0]);
+@@ -167,8 +178,6 @@
+   // rather than a stub that always rejects.
+   testing.expectEqual('undefined', typeof navigator.getBattery);
+ </script>
+-
+-
+ <script id=sendBeacon>
+   // Nothing is sent, but "queued" keeps callers off their sync-XHR fallback.
+   testing.expectEqual(true, navigator.sendBeacon('/analytics'));
+diff --git a/src/browser/tests/testing.js b/src/browser/tests/testing.js
+index f53ea30ad..a3a87d879 100644
+--- a/src/browser/tests/testing.js
++++ b/src/browser/tests/testing.js
+@@ -148,7 +148,7 @@
+     console.warn('Pending count:', Array.from(async_pending.keys()));
+   }
+ 
+-  const IS_TEST_RUNNER = window.navigator.userAgent.startsWith("Lightpanda/");
++  const IS_TEST_RUNNER = window.navigator.vendor === "" && window.navigator.product === "Gecko";
+ 
+   window.testing = {
+     fail: fail,
+diff --git a/src/browser/webapi/Navigator.zig b/src/browser/webapi/Navigator.zig
+index b73b6e906..3e624363c 100644
+--- a/src/browser/webapi/Navigator.zig
++++ b/src/browser/webapi/Navigator.zig
+@@ -69,8 +69,12 @@ pub fn getAppCodeName(_: *const Navigator) []const u8 {
+     return "Mozilla";
+ }
+ 
+-pub fn getAppVersion(_: *const Navigator) []const u8 {
+-    return "1.0";
++pub fn getAppVersion(_: *const Navigator, exec: *const Execution) []const u8 {
++    const ua = exec.session.browser.http_client.getUserAgent();
++    if (std.mem.indexOfScalar(u8, ua, '/')) |index| {
++        return ua[index + 1 ..];
++    }
++    return ua;
+ }
+ 
+ pub fn getLanguage(self: *const Navigator, exec: *const Execution) []const u8 {
+diff --git a/src/browser/webapi/NavigatorUAData.zig b/src/browser/webapi/NavigatorUAData.zig
+index 37fce6afd..3d8eb3c73 100644
+--- a/src/browser/webapi/NavigatorUAData.zig
++++ b/src/browser/webapi/NavigatorUAData.zig
+@@ -62,8 +62,6 @@ fn getHighEntropyValues(_: *const NavigatorUAData, hints: []const []const u8, ex
+ 
+     _ = hints;
+ 
+-    const brands = brandList();
+-
+     return exec.js.local.?.resolvePromise(.{
+         .brands = brandList(),
+         .mobile = false,
+@@ -72,19 +70,26 @@ fn getHighEntropyValues(_: *const NavigatorUAData, hints: []const []const u8, ex
+         .bitness = uaBitness(),
+         .model = "",
+         .platformVersion = "",
+-        .uaFullVersion = if (brands.len > 0) brands[0].version else "1.0.0.0",
+-        .fullVersionList = brands,
++        .uaFullVersion = Config.HttpHeaders.ua_full_version,
++        .fullVersionList = fullVersionList(),
+         .wow64 = false,
+         .formFactor = [_][]const u8{"Desktop"},
+     });
+ }
+ 
+ fn brandList() []const Brand {
++    return configBrandList(&Config.HttpHeaders.brands);
++}
++
++fn fullVersionList() []const Brand {
++    return configBrandList(&Config.HttpHeaders.full_version_brands);
++}
++
++fn configBrandList(comptime src: anytype) []const Brand {
+     const out = comptime blk: {
+-        const src = &Config.HttpHeaders.brands;
+         var arr: [src.len]Brand = undefined;
+         for (src, 0..) |b, i| {
+-            arr[i] = .{ .brand = b.brand, .version = b.full_version };
++            arr[i] = .{ .brand = b.brand, .version = b.version };
+         }
+         const final = arr;
+         break :blk final;
+diff --git a/src/browser/webapi/WorkerNavigator.zig b/src/browser/webapi/WorkerNavigator.zig
+index bbc92647d..47373bab9 100644
+--- a/src/browser/webapi/WorkerNavigator.zig
++++ b/src/browser/webapi/WorkerNavigator.zig
+@@ -58,8 +58,8 @@ fn getAppCodeName(_: *const WorkerNavigator) []const u8 {
+     return Navigator.getAppCodeName(&Navigator.init);
+ }
+ 
+-fn getAppVersion(_: *const WorkerNavigator) []const u8 {
+-    return Navigator.getAppVersion(&Navigator.init);
++fn getAppVersion(_: *const WorkerNavigator, exec: *const Execution) []const u8 {
++    return Navigator.getAppVersion(&Navigator.init, exec);
+ }
+ 
+ fn getLanguage(_: *const WorkerNavigator, exec: *const Execution) []const u8 {

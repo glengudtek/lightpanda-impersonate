@@ -1,0 +1,8 @@
+.{
+    .full_version = "150.0.7871.46",
+    .include_google_chrome_brand = true,
+    .additional_brands = .{},
+    .manual_brands = null,
+    .user_agent = null,
+    .curl_impersonate = "chrome150",
+}

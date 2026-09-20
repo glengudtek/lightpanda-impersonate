@@ -1,0 +1,198 @@
+diff --git a/src/Config.zig b/src/Config.zig
+index e00dac697..26816f756 100644
+--- a/src/Config.zig
++++ b/src/Config.zig
+@@ -975,14 +975,20 @@ pub const HttpHeaders = struct {
+         .{ .brand = "Lightpanda", .version = "1", .full_version = lp.build_config.version },
+     };
+ 
+-    pub const sec_ch_ua: [:0]const u8 = blk: {
++    pub fn secChUaForBrands(comptime brand_list: anytype) ?[:0]const u8 {
++        if (brand_list.len == 0) {
++            return null;
++        }
++
+         var out: [:0]const u8 = "";
+-        for (brands, 0..) |b, i| {
++        for (brand_list, 0..) |b, i| {
+             const sep = if (i == 0) "" else ", ";
+             out = out ++ sep ++ "\"" ++ b.brand ++ "\";v=\"" ++ b.version ++ "\"";
+         }
+-        break :blk out;
+-    };
++        return out;
++    }
++
++    pub const sec_ch_ua: ?[:0]const u8 = secChUaForBrands(brands);
+ 
+     pub const sec_ch_ua_full_version_list: [:0]const u8 = blk: {
+         var out: [:0]const u8 = "";
+@@ -1001,7 +1007,7 @@ pub const HttpHeaders = struct {
+     // Document-navigation Accept value Chrome sends.
+     pub const navigation_accept: [:0]const u8 = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8";
+ 
+-    user_agent: [:0]const u8, // User agent value (e.g. "Lightpanda/1.0")
++    user_agent: [:0]const u8,
+ 
+     proxy_bearer_header: ?[:0]const u8,
+ 
+@@ -1346,8 +1352,8 @@ test "Config: parseArgs --http-session-timeout" {
+ 
+ test "Config: validateUserAgent" {
+     try validateUserAgent("Lightpanda/1.0");
+-    try std.testing.expectError(error.Reserved, validateUserAgent("mozilla/1.0"));
+-    try std.testing.expectError(error.Reserved, validateUserAgent("Mozilla/5.0"));
++    try validateUserAgent("mozilla/1.0");
++    try validateUserAgent("Mozilla/5.0");
+     try std.testing.expectError(error.NonPrintable, validateUserAgent("bad\x01ua"));
+ }
+ 
+@@ -1555,7 +1561,7 @@ fn accumulateValidator(allocator: Allocator, args: *std.process.Args.Iterator, f
+ fn userAgentValidator(allocator: Allocator, args: *std.process.Args.Iterator, ua: *?[]const u8) !void {
+     const str = args.next() orelse return error.MissingArgument;
+     validateUserAgent(str) catch |err| {
+-        log.fatal(.app, "invalid user-agent", .{ .err = err, .hint = "must be printable ASCII and can't contain Mozilla" });
++        log.fatal(.app, "invalid user-agent", .{ .err = err, .hint = "must be printable ASCII" });
+         return error.InvalidArgument;
+     };
+ 
+@@ -1568,10 +1574,10 @@ pub fn validateUserAgent(ua: []const u8) !void {
+             return error.NonPrintable;
+         }
+     }
++}
+ 
+-    if (std.ascii.indexOfIgnoreCase(ua, "mozilla") != null) {
+-        return error.Reserved;
+-    }
++test "Config.HttpHeaders: omits Sec-Ch-Ua when brands are empty" {
++    try std.testing.expectEqual(null, HttpHeaders.secChUaForBrands(.{}));
+ }
+ 
+ fn localeValidator(allocator: Allocator, args: *std.process.Args.Iterator, field: *[:0]const u8) !void {
+diff --git a/src/help.zon b/src/help.zon
+index 0ee486c95..683de267b 100644
+--- a/src/help.zon
++++ b/src/help.zon
+@@ -488,11 +488,10 @@
+     \\          Time zone used by Date and Intl, e.g. Europe/Paris or UTC.
+     \\          Defaults to the host time zone.
+     \\  --user-agent <STRING>
+-    \\          Override the User-Agent header entirely. Must not impersonate other
+-    \\          browsers; any value containing "Mozilla" is forbidden. The browser
+-    \\          still sends Sec-Ch-Ua. Incompatible with --user-agent-suffix.
++    \\          Override the User-Agent header entirely.
++    \\          Incompatible with --user-agent-suffix.
+     \\  --user-agent-suffix <STRING>
+-    \\          Suffix appended to the Lightpanda/X.Y User-Agent.
++    \\          Suffix appended to the default User-Agent.
+     \\  --v8-flags-unsafe <FLAGS>
+     \\          Flags passed as-is to the V8 JavaScript engine, space-separated.
+     \\          e.g. --v8-flags-unsafe "--expose-gc --stack-size 1000".
+diff --git a/src/network/HttpClient.zig b/src/network/HttpClient.zig
+index fd469377e..25b299f75 100644
+--- a/src/network/HttpClient.zig
++++ b/src/network/HttpClient.zig
+@@ -456,10 +456,9 @@ pub fn getLanguages(self: *const Client) []const []const u8 {
+ }
+ 
+ // Headers _all_ requests include.
+-pub fn baselineHeaders(self: *const Client) [4]Transfer.RequestHeader {
++pub fn baselineHeaders(self: *const Client) [3]Transfer.RequestHeader {
+     return .{
+         .{ .name = "User-Agent", .value = self.getUserAgent() },
+-        .{ .name = "Sec-Ch-Ua", .value = lp.Config.HttpHeaders.sec_ch_ua, .source = .fixed },
+         .{ .name = "Sec-Ch-Ua-Full-Version-List", .value = lp.Config.HttpHeaders.sec_ch_ua_full_version_list, .source = .fixed },
+         // Omitting Accept-Language triggers bot-protection on some CDNs
+         // (Akamai) when Accept-Encoding is present.
+@@ -3587,6 +3586,9 @@ pub const Transfer = struct {
+ 
+     // The client's baseline headers, added to every request at creation.
+     fn seedHeaders(self: *Transfer) !void {
++        if (lp.Config.HttpHeaders.sec_ch_ua) |value| {
++            try self.addHeader("Sec-Ch-Ua", value, .{ .source = .fixed });
++        }
+         for (self.client.baselineHeaders()) |hdr| {
+             try self.addHeader(hdr.name, hdr.value, .{ .source = hdr.source });
+         }
+@@ -4658,10 +4660,9 @@ test "HttpClient: Transfer header layering" {
+     try transfer.appendHeader("SEC-CH-UA", "\"Chromium\";v=\"140\"", .{ .source = .author });
+     try testing.expectEqual("\"Lightpanda\";v=\"1\"", transfer.findRequestHeader("sec-ch-ua").?);
+ 
+-    // an invalid User-Agent never enters the list
+-    testing.expectLog(&.{.http});
++    // Mozilla User-Agents are accepted for impersonation.
+     try transfer.setHeader("user-agent", "Mozilla/5.0", .{ .source = .author });
+-    try testing.expectEqual("Lightpanda/1.0", transfer.findRequestHeader("user-agent").?);
++    try testing.expectEqual("Mozilla/5.0", transfer.findRequestHeader("user-agent").?);
+ 
+     // a valid author User-Agent replaces the default
+     try transfer.setHeader("User-Agent", "MyBot/2.0", .{ .source = .author });
+diff --git a/src/server/cdp/domains/emulation.zig b/src/server/cdp/domains/emulation.zig
+index a12510a60..b40def706 100644
+--- a/src/server/cdp/domains/emulation.zig
++++ b/src/server/cdp/domains/emulation.zig
+@@ -151,9 +151,8 @@ pub fn setUserAgentOverride(cmd: *CDP.Command) !void {
+     }
+ 
+     const ua = params.userAgent;
+-    const reserved = if (Config.validateUserAgent(ua)) false else |err| switch (err) {
++    Config.validateUserAgent(ua) catch |err| switch (err) {
+         error.NonPrintable => return cmd.sendError(-32602, "User agent contains non-printable characters", .{}),
+-        error.Reserved => true,
+     };
+ 
+     const bc = cmd.browser_context orelse return error.BrowserContextNotLoaded;
+@@ -168,11 +167,6 @@ pub fn setUserAgentOverride(cmd: *CDP.Command) !void {
+         try http_client.setAcceptLanguageOverride(accept_language);
+     }
+ 
+-    if (reserved) {
+-        log.warn(.not_implemented, "Emulation.setUserAgentOverride", .{ .param = "userAgent", .value = ua, .info = "User agent must not contain Mozilla" });
+-        return cmd.sendResult(null, .{});
+-    }
+-
+     try http_client.setUserAgentOverride(ua);
+     bc.user_agent_changed = true;
+ 
+@@ -344,9 +338,7 @@ test "cdp.Emulation: setUserAgentOverride with valid user agent" {
+     try ctx.expectSentResult(null, .{ .id = 1 });
+ }
+ 
+-test "cdp.Emulation: setUserAgentOverride ignores mozilla" {
+-    testing.silenceLog(&.{.not_implemented});
+-
++test "cdp.Emulation: setUserAgentOverride accepts mozilla" {
+     var ctx = try testing.context();
+     defer ctx.deinit();
+     _ = try ctx.loadBrowserContext(.{ .id = "BID-UA2" });
+@@ -357,13 +349,12 @@ test "cdp.Emulation: setUserAgentOverride ignores mozilla" {
+         .params = .{ .userAgent = "Mozilla/5.0 (Windows NT 10.0)" },
+     });
+ 
+-    try ctx.expectSentResult(null, .{});
+-    try testing.expectEqual(false, ctx.cdp().browser_context.?.user_agent_changed);
++    try ctx.expectSentResult(null, .{ .id = 2 });
++    try testing.expectEqual(true, ctx.cdp().browser_context.?.user_agent_changed);
++    try std.testing.expectEqualStrings("Mozilla/5.0 (Windows NT 10.0)", ctx.cdp().browser.http_client.getUserAgent());
+ }
+ 
+-test "cdp.Emulation: setUserAgentOverride ignores mozilla case insensitive" {
+-    testing.silenceLog(&.{.not_implemented});
+-
++test "cdp.Emulation: setUserAgentOverride accepts mozilla case insensitive" {
+     var ctx = try testing.context();
+     defer ctx.deinit();
+     _ = try ctx.loadBrowserContext(.{ .id = "BID-UA3" });
+@@ -374,8 +365,9 @@ test "cdp.Emulation: setUserAgentOverride ignores mozilla case insensitive" {
+         .params = .{ .userAgent = "MOZILLA/5.0 test" },
+     });
+ 
+-    try ctx.expectSentResult(null, .{});
+-    try testing.expectEqual(false, ctx.cdp().browser_context.?.user_agent_changed);
++    try ctx.expectSentResult(null, .{ .id = 3 });
++    try testing.expectEqual(true, ctx.cdp().browser_context.?.user_agent_changed);
++    try std.testing.expectEqualStrings("MOZILLA/5.0 test", ctx.cdp().browser.http_client.getUserAgent());
+ }
+ 
+ test "cdp.Emulation: setUserAgentOverride rejects non-printable characters" {

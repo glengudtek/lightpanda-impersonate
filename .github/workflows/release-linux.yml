@@ -1,0 +1,134 @@
+name: release linux
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  metadata:
+    runs-on: ubuntu-22.04
+    outputs:
+      release: ${{ steps.version.outputs.release }}
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Read Lightpanda version
+        id: version
+        run: |
+          git -C lightpanda-browser fetch --tags --force
+          RELEASE="$(git -C lightpanda-browser describe --tags --exact-match HEAD)"
+          echo "release=${RELEASE}" >> "${GITHUB_OUTPUT}"
+
+  build-linux:
+    needs: metadata
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+            cpu_flag: -Dcpu=x86_64
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+            cpu_flag: -Dcpu=generic
+
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 25
+
+    env:
+      ARCH: ${{ matrix.arch }}
+      OS: linux
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Apply patches
+        run: ./scripts/apply-patches.sh
+
+      - uses: ./lightpanda-browser/.github/actions/install
+        with:
+          os: ${{ env.OS }}
+          arch: ${{ env.ARCH }}
+
+      - name: Use Lightpanda Zig version
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Verify Zig version
+        run: zig version
+
+      - name: Download prebuilt V8
+        working-directory: lightpanda-browser
+        run: make download-v8
+
+      - name: Download static curl-impersonate
+        run: ./scripts/download-curl-impersonate.sh
+
+      - name: Build V8 snapshot
+        working-directory: lightpanda-browser
+        run: |
+          V8_ARCHIVE="$(find .lp-cache/prebuilt-v8 -name "libc_v8_*_${OS}_${ARCH}.a" -print -quit)"
+          zig build -Dprebuilt_v8_path="${V8_ARCHIVE}" -Doptimize=ReleaseFast snapshot_creator -- src/snapshot.bin
+
+      - name: Build Lightpanda
+        working-directory: lightpanda-browser
+        env:
+          RELEASE: ${{ needs.metadata.outputs.release }}
+        run: |
+          V8_ARCHIVE="$(find .lp-cache/prebuilt-v8 -name "libc_v8_*_${OS}_${ARCH}.a" -print -quit)"
+          zig build -Dsnapshot_path=../../snapshot.bin -Dprebuilt_v8_path="${V8_ARCHIVE}" -Doptimize=ReleaseFast ${{ matrix.cpu_flag }} -Dversion="${RELEASE}"
+
+      - name: Rename binary
+        run: mv lightpanda-browser/zig-out/bin/lightpanda lightpanda-impersonate-${{ env.ARCH }}-${{ env.OS }}
+
+      - name: Verify curl-impersonate is statically linked
+        run: |
+          if readelf -d lightpanda-impersonate-${{ env.ARCH }}-${{ env.OS }} | grep -Fq 'libcurl-impersonate.so'; then
+            echo "release binary still depends on shared libcurl-impersonate" >&2
+            exit 1
+          fi
+
+      - name: Test live impersonation
+        run: python3 scripts/live-test.py --binary "./lightpanda-impersonate-${ARCH}-${OS}" --curl-profile chrome146 --ua-profile ua-profile.zon
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: lightpanda-impersonate-${{ env.ARCH }}-${{ env.OS }}
+          path: lightpanda-impersonate-${{ env.ARCH }}-${{ env.OS }}
+          retention-days: 7
+
+  publish:
+    needs:
+      - metadata
+      - build-linux
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish GitHub Release
+        uses: ncipollo/release-action@v1
+        with:
+          allowUpdates: true
+          artifacts: dist/*
+          name: ${{ needs.metadata.outputs.release }}
+          tag: ${{ needs.metadata.outputs.release }}
+          commit: ${{ github.sha }}
+          makeLatest: true
+          replacesArtifacts: true
